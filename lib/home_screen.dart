@@ -273,7 +273,7 @@ class _HomeScreenState extends State<HomeScreen> {
             displayName: UserService().displayName,
             deviceId: _mesh.deviceId,
             peers: _peers,
-            peerNames: _mesh.peerNames,
+            endpointNames: _mesh.endpointNames,
             onReconnect: _mesh.restart,
             onEditName: _editDisplayName,
           ),
@@ -400,7 +400,7 @@ class _StatusBanner extends StatelessWidget {
     required this.displayName,
     required this.deviceId,
     required this.peers,
-    required this.peerNames,
+    required this.endpointNames,
     required this.onReconnect,
     required this.onEditName,
   });
@@ -408,7 +408,7 @@ class _StatusBanner extends StatelessWidget {
   final String displayName;
   final String deviceId;
   final Set<String> peers;
-  final Map<String, String> peerNames;
+  final Map<String, String> endpointNames;
   final VoidCallback onReconnect;
   final VoidCallback onEditName;
 
@@ -422,15 +422,14 @@ class _StatusBanner extends StatelessWidget {
         color: _surface,
         border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
       child: Row(
         children: [
           // Own name chip — tappable to edit
           GestureDetector(
             onTap: onEditName,
             child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
               decoration: BoxDecoration(
                 color: _primary.withValues(alpha: 0.08),
                 borderRadius: BorderRadius.circular(20),
@@ -455,52 +454,62 @@ class _StatusBanner extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          // Peer status chip
+          // Horizontally scrollable connected peers
           Expanded(
-            child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: connected
-                    ? const Color(0xFFECFDF5)
-                    : Colors.grey.shade100,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: connected
-                      ? const Color(0xFF6EE7B7)
-                      : Colors.grey.shade300,
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(
-                      color: connected
-                          ? const Color(0xFF10B981)
-                          : Colors.grey.shade400,
-                      shape: BoxShape.circle,
+            child: connected
+                ? SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: peers.map((endpointId) {
+                        final name = endpointNames[endpointId];
+                        final label = (name != null && name.isNotEmpty)
+                            ? name
+                            : '···';
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFECFDF5),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                  color: const Color(0xFF6EE7B7)),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 6,
+                                  height: 6,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFF10B981),
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  label,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF065F46),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  )
+                : Text(
+                    'Taranıyor…',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade500,
                     ),
                   ),
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      _peerChipLabel(connected, peers, peerNames),
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: connected
-                            ? const Color(0xFF065F46)
-                            : Colors.grey.shade600,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            ),
           ),
           const SizedBox(width: 4),
           GestureDetector(
@@ -519,28 +528,6 @@ class _StatusBanner extends StatelessWidget {
         ],
       ),
     );
-  }
-
-  String _peerChipLabel(
-    bool connected,
-    Set<String> peers,
-    Map<String, String> peerNames,
-  ) {
-    if (!connected) return 'Taranıyor…';
-    // Show names if we have them and count is small enough to fit.
-    if (peers.length <= 3) {
-      final names = peers
-          .map((id) => peerNames.values.isNotEmpty
-              ? (peerNames.entries
-                      .where((e) => e.key == id)
-                      .map((e) => e.value)
-                      .firstOrNull ??
-                  id.substring(0, 4))
-              : id.substring(0, 4))
-          .join(', ');
-      return names;
-    }
-    return '${peers.length} cihaz bağlı';
   }
 }
 

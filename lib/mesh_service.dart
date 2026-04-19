@@ -87,8 +87,10 @@ class MeshService {
   final Set<String> _pendingConnections = {};
   final Map<String, int> _endpointLastSeen = {};
 
-  // Maps deviceId → display name, populated from HELLO packets.
+  // Maps deviceId → display name, populated from HELLO packets (used for packets).
   final Map<String, String> _peerNames = {};
+  // Maps endpointId → display name (used for the peers UI list).
+  final Map<String, String> _endpointNames = {};
 
   Timer? _cleanupTimer;
 
@@ -114,6 +116,7 @@ class MeshService {
   Stream<Set<String>> get peersStream => _peersController.stream;
   Set<String> get connectedEndpoints => Set.unmodifiable(_connectedEndpoints);
   Map<String, String> get peerNames => Map.unmodifiable(_peerNames);
+  Map<String, String> get endpointNames => Map.unmodifiable(_endpointNames);
   int get connectedPeerCount => _connectedEndpoints.length;
 
   // ── Initialization ───────────────────────────────────────────────────────
@@ -147,6 +150,7 @@ class MeshService {
     _pendingConnections.clear();
     _endpointLastSeen.clear();
     _peerNames.clear();
+    _endpointNames.clear();
     _peersController.add({});
 
     // Tear down stale Nearby Connections session from previous run / hot-restart.
@@ -269,9 +273,10 @@ class MeshService {
                 if (parsed['kind'] == 'hello') {
                   final sid = (parsed['sid'] as String?) ?? '';
                   final name = (parsed['name'] as String?) ?? '';
-                  if (sid.isNotEmpty && name.isNotEmpty) {
-                    _peerNames[sid] = name;
-                    // Trigger UI rebuild with updated peer names.
+                  if (name.isNotEmpty) {
+                    if (sid.isNotEmpty) _peerNames[sid] = name;
+                    // Also key by endpointId so the peers UI can look up names.
+                    _endpointNames[senderEndpointId] = name;
                     _peersController.add(Set.from(_connectedEndpoints));
                   }
                   return;
@@ -303,6 +308,7 @@ class MeshService {
     _connectedEndpoints.remove(endpointId);
     _pendingConnections.remove(endpointId);
     _endpointLastSeen.remove(endpointId);
+    _endpointNames.remove(endpointId);
     _peersController.add(Set.from(_connectedEndpoints));
     // Do NOT restart discovery here — already running continuously.
   }
