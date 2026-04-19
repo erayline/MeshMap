@@ -68,12 +68,24 @@ class MeshService {
   static const int _initialTtl = 10;
   static const String _serviceId = 'com.example.meshapp.nearby';
 
+  // Ghost endpoint detection: an endpoint is evicted if no payload has been
+  // received from it within this window. LocationService beacons every 30 s,
+  // so 90 s = 3 missed beacons — a safe threshold before declaring a peer dead.
+  static const Duration _staleThreshold = Duration(seconds: 90);
+  static const Duration _cleanupInterval = Duration(seconds: 45);
+
   late String deviceId;
 
   final Set<String> _connectedEndpoints = {};
   final Set<String> _seenIds = {};
-  // Guards against duplicate requestConnection calls for the same endpoint.
   final Set<String> _pendingConnections = {};
+
+  // Tracks the last time we received ANY payload from each Nearby endpoint.
+  // Used by the cleanup timer to evict ghost peers whose onDisconnected never
+  // fired (common on some custom Android ROMs and older GMS versions).
+  final Map<String, int> _endpointLastSeen = {};
+
+  Timer? _cleanupTimer;
 
   final Map<String, MeshPacket> latestLocations = {};
   final Map<String, MeshPacket> latestDamage = {};
@@ -109,30 +121,43 @@ class MeshService {
   // ── Networking ───────────────────────────────────────────────────────────
 
   Future<void> start() async {
-    // Tear down any stale session from a previous run or hot-restart before
-    // starting fresh. Skipping this step is the #1 cause of "stopped working"
-    // bugs — startAdvertising/startDiscovery throw if already running, and
-    // those errors were previously swallowed silently.
+    _cleanupTimer?.cancel();
+
+    // Clear our state FIRST so that the stopAllEndpoints() onDisconnected
+    // callbacks below are no-ops and don't trigger spurious side-effects.
+    _connectedEndpoints.clear();
+    _pendingConnections.clear();
+    _endpointLastSeen.clear();
+    _peersController.add({});
+
+    // Tear down any stale Nearby Connections session from a previous run or
+    // hot-restart. startAdvertising/startDiscovery throw if already running,
+    // and those errors were previously swallowed silently → nothing connected.
     try { await Nearby().stopAllEndpoints(); } catch (_) {}
     try { await Nearby().stopAdvertising(); } catch (_) {}
     try { await Nearby().stopDiscovery(); } catch (_) {}
-    _connectedEndpoints.clear();
-    _pendingConnections.clear();
-    _peersController.add({});
 
     // Let the platform layer finish winding down before we restart.
     await Future.delayed(const Duration(milliseconds: 500));
 
     await _startAdvertising();
     await _startDiscovery();
+
+    // Periodically evict ghost endpoints that never fired onDisconnected.
+    _cleanupTimer = Timer.periodic(_cleanupInterval, (_) => _evictStaleEndpoints());
   }
 
   Future<void> stop() async {
+    _cleanupTimer?.cancel();
+    _cleanupTimer = null;
+
     try { await Nearby().stopAllEndpoints(); } catch (_) {}
     try { await Nearby().stopAdvertising(); } catch (_) {}
     try { await Nearby().stopDiscovery(); } catch (_) {}
+
     _connectedEndpoints.clear();
     _pendingConnections.clear();
+    _endpointLastSeen.clear();
     _peersController.add({});
   }
 
@@ -149,7 +174,7 @@ class MeshService {
         serviceId: _serviceId,
       );
     } catch (_) {
-      // May fail if platform takes longer to wind down — retry once.
+      // Platform may take longer to wind down — retry once after a pause.
       await Future.delayed(const Duration(seconds: 1));
       try {
         await Nearby().startAdvertising(
@@ -194,7 +219,6 @@ class MeshService {
     String name,
     String serviceId,
   ) async {
-    // Skip if already connected or a connection attempt is already in-flight.
     if (_connectedEndpoints.contains(endpointId)) return;
     if (_pendingConnections.contains(endpointId)) return;
     _pendingConnections.add(endpointId);
@@ -212,12 +236,17 @@ class MeshService {
   }
 
   void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
-    // acceptConnection returns Future<bool>. We must not drop the future —
-    // silent failures here mean packets are never received.
+    // acceptConnection registers the payload handler. Not awaiting this
+    // silently drops the future — use .catchError to handle failures.
     Nearby()
         .acceptConnection(
           endpointId,
-          onPayLoadRecieved: (id, payload) {
+          onPayLoadRecieved: (senderEndpointId, payload) {
+            // Refresh last-seen timestamp for this Nearby endpoint so the
+            // ghost-cleanup timer knows it's still alive.
+            _endpointLastSeen[senderEndpointId] =
+                DateTime.now().millisecondsSinceEpoch;
+
             if (payload.type == PayloadType.BYTES && payload.bytes != null) {
               try {
                 final packet = MeshPacket.fromJsonString(
@@ -236,6 +265,9 @@ class MeshService {
     _pendingConnections.remove(endpointId);
     if (status == Status.CONNECTED) {
       _connectedEndpoints.add(endpointId);
+      // Seed last-seen so the new peer has the full stale window before the
+      // cleanup timer could evict it (in case it doesn't send immediately).
+      _endpointLastSeen[endpointId] = DateTime.now().millisecondsSinceEpoch;
       _peersController.add(Set.from(_connectedEndpoints));
     }
   }
@@ -243,9 +275,28 @@ class MeshService {
   void _onDisconnected(String endpointId) {
     _connectedEndpoints.remove(endpointId);
     _pendingConnections.remove(endpointId);
+    _endpointLastSeen.remove(endpointId);
     _peersController.add(Set.from(_connectedEndpoints));
-    // Restart discovery so we can find and reconnect to the lost peer (or new ones).
-    _startDiscovery();
+    // Do NOT restart discovery here — it's already running continuously and
+    // calling startDiscovery() while it's active just throws and creates races.
+  }
+
+  // Evicts peers whose onDisconnected never fired (GMS bug on some devices).
+  void _evictStaleEndpoints() {
+    final cutoff =
+        DateTime.now().millisecondsSinceEpoch - _staleThreshold.inMilliseconds;
+    bool changed = false;
+    for (final id in List<String>.from(_connectedEndpoints)) {
+      final lastSeen = _endpointLastSeen[id] ?? 0;
+      if (lastSeen < cutoff) {
+        // Best-effort disconnect — may be a no-op if the endpoint is already gone.
+        Nearby().disconnectFromEndpoint(id);
+        _connectedEndpoints.remove(id);
+        _endpointLastSeen.remove(id);
+        changed = true;
+      }
+    }
+    if (changed) _peersController.add(Set.from(_connectedEndpoints));
   }
 
   // ── Packet handling ──────────────────────────────────────────────────────
@@ -289,10 +340,10 @@ class MeshService {
     if (packet.ttl <= 0 || _connectedEndpoints.isEmpty) return;
     final bytes = Uint8List.fromList(utf8.encode(packet.toJsonString()));
     for (final id in List<String>.from(_connectedEndpoints)) {
-      Nearby().sendBytesPayload(id, bytes).catchError((_) {
-        _connectedEndpoints.remove(id);
-        _peersController.add(Set.from(_connectedEndpoints));
-      });
+      // sendBytesPayload in the native plugin always returns success even for
+      // dead endpoints — we cannot rely on catchError for ghost detection.
+      // Ghost cleanup is handled by _evictStaleEndpoints() instead.
+      Nearby().sendBytesPayload(id, bytes);
     }
   }
 
@@ -431,6 +482,7 @@ class MeshService {
         ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
   void dispose() {
+    _cleanupTimer?.cancel();
     Nearby().stopAdvertising();
     Nearby().stopDiscovery();
     Nearby().stopAllEndpoints();
