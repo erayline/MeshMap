@@ -80,7 +80,11 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          _DeviceInfoBanner(deviceId: _mesh.deviceId, peers: _peers),
+          _DeviceInfoBanner(
+            deviceId: _mesh.deviceId,
+            peers: _peers,
+            onReconnect: () => _mesh.restart(),
+          ),
           Expanded(child: _buildIncidentFeed(cs)),
         ],
       ),
@@ -213,10 +217,15 @@ class _IncidentCard extends StatelessWidget {
 }
 
 class _DeviceInfoBanner extends StatelessWidget {
-  const _DeviceInfoBanner({required this.deviceId, required this.peers});
+  const _DeviceInfoBanner({
+    required this.deviceId,
+    required this.peers,
+    required this.onReconnect,
+  });
 
   final String deviceId;
   final Set<String> peers;
+  final VoidCallback onReconnect;
 
   @override
   Widget build(BuildContext context) {
@@ -267,6 +276,13 @@ class _DeviceInfoBanner extends StatelessWidget {
                   style: const TextStyle(fontSize: 12, color: Colors.white70),
                   overflow: TextOverflow.ellipsis,
                 ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.refresh, size: 18, color: Colors.white54),
+                tooltip: 'Ağı Yeniden Bağla',
+                onPressed: onReconnect,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
               ),
             ],
           ),

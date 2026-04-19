@@ -78,13 +78,15 @@ class _PermissionGateState extends State<PermissionGate> {
       Permission.locationWhenInUse,
     ];
 
-    final denied = statuses.entries
-        .where((e) =>
-            criticalPerms.contains(e.key) &&
-            (e.value.isDenied || e.value.isPermanentlyDenied))
-        .toList();
+    // Every critical permission must be present in statuses (i.e. the request
+    // didn't throw) AND must not be denied. If a request threw and the
+    // permission is absent from statuses we treat it as denied.
+    final allGranted = criticalPerms.every((p) {
+      final s = statuses[p];
+      return s != null && !s.isDenied && !s.isPermanentlyDenied;
+    });
 
-    if (statuses.isNotEmpty && denied.isEmpty) {
+    if (allGranted) {
       try {
         await MeshService().init();
         await MeshService().start();
@@ -101,12 +103,15 @@ class _PermissionGateState extends State<PermissionGate> {
         }
       }
     } else {
-      final names = denied.map((e) => e.key.toString().split('.').last).join('\n  • ');
+      final missing = criticalPerms.where((p) {
+        final s = statuses[p];
+        return s == null || s.isDenied || s.isPermanentlyDenied;
+      }).map((p) => p.toString().split('.').last).join('\n  • ');
       if (mounted) {
         setState(() {
           _loading = false;
           _granted = false;
-          _statusMessage = 'Permissions needed:\n  • $names\n\nTap "Open Settings" to grant them.';
+          _statusMessage = 'Permissions needed:\n  • $missing\n\nTap "Open Settings" to grant them.';
         });
       }
     }

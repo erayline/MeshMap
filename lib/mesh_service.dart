@@ -72,8 +72,9 @@ class MeshService {
 
   final Set<String> _connectedEndpoints = {};
   final Set<String> _seenIds = {};
+  // Guards against duplicate requestConnection calls for the same endpoint.
+  final Set<String> _pendingConnections = {};
 
-  // Latest location packet per sender — survives screen navigation.
   final Map<String, MeshPacket> latestLocations = {};
   final Map<String, MeshPacket> latestDamage = {};
   final Map<String, MeshPacket> latestSOS = {};
@@ -108,9 +109,34 @@ class MeshService {
   // ── Networking ───────────────────────────────────────────────────────────
 
   Future<void> start() async {
+    // Tear down any stale session from a previous run or hot-restart before
+    // starting fresh. Skipping this step is the #1 cause of "stopped working"
+    // bugs — startAdvertising/startDiscovery throw if already running, and
+    // those errors were previously swallowed silently.
+    try { await Nearby().stopAllEndpoints(); } catch (_) {}
+    try { await Nearby().stopAdvertising(); } catch (_) {}
+    try { await Nearby().stopDiscovery(); } catch (_) {}
+    _connectedEndpoints.clear();
+    _pendingConnections.clear();
+    _peersController.add({});
+
+    // Let the platform layer finish winding down before we restart.
+    await Future.delayed(const Duration(milliseconds: 500));
+
     await _startAdvertising();
     await _startDiscovery();
   }
+
+  Future<void> stop() async {
+    try { await Nearby().stopAllEndpoints(); } catch (_) {}
+    try { await Nearby().stopAdvertising(); } catch (_) {}
+    try { await Nearby().stopDiscovery(); } catch (_) {}
+    _connectedEndpoints.clear();
+    _pendingConnections.clear();
+    _peersController.add({});
+  }
+
+  Future<void> restart() => stop().then((_) => start());
 
   Future<void> _startAdvertising() async {
     try {
@@ -123,7 +149,18 @@ class MeshService {
         serviceId: _serviceId,
       );
     } catch (_) {
-      // May already be advertising; safe to ignore for a prototype.
+      // May fail if platform takes longer to wind down — retry once.
+      await Future.delayed(const Duration(seconds: 1));
+      try {
+        await Nearby().startAdvertising(
+          deviceId,
+          Strategy.P2P_CLUSTER,
+          onConnectionInitiated: _onConnectionInitiated,
+          onConnectionResult: _onConnectionResult,
+          onDisconnected: _onDisconnected,
+          serviceId: _serviceId,
+        );
+      } catch (_) {}
     }
   }
 
@@ -132,47 +169,71 @@ class MeshService {
       await Nearby().startDiscovery(
         deviceId,
         Strategy.P2P_CLUSTER,
-        onEndpointFound: (endpointId, name, serviceId) async {
-          try {
-            await Nearby().requestConnection(
-              deviceId,
-              endpointId,
-              onConnectionInitiated: _onConnectionInitiated,
-              onConnectionResult: _onConnectionResult,
-              onDisconnected: _onDisconnected,
-            );
-          } catch (_) {
-            // Connection attempt already in-flight or rejected — ignore.
-          }
-        },
+        onEndpointFound: _onEndpointFound,
         onEndpointLost: (_) {},
         serviceId: _serviceId,
       );
-    } catch (_) {}
+    } catch (_) {
+      await Future.delayed(const Duration(seconds: 1));
+      try {
+        await Nearby().startDiscovery(
+          deviceId,
+          Strategy.P2P_CLUSTER,
+          onEndpointFound: _onEndpointFound,
+          onEndpointLost: (_) {},
+          serviceId: _serviceId,
+        );
+      } catch (_) {}
+    }
   }
 
   // ── Connection callbacks ─────────────────────────────────────────────────
 
+  Future<void> _onEndpointFound(
+    String endpointId,
+    String name,
+    String serviceId,
+  ) async {
+    // Skip if already connected or a connection attempt is already in-flight.
+    if (_connectedEndpoints.contains(endpointId)) return;
+    if (_pendingConnections.contains(endpointId)) return;
+    _pendingConnections.add(endpointId);
+    try {
+      await Nearby().requestConnection(
+        deviceId,
+        endpointId,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+    } catch (_) {
+      _pendingConnections.remove(endpointId);
+    }
+  }
+
   void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
-    Nearby().acceptConnection(
-      endpointId,
-      onPayLoadRecieved: (id, payload) {
-        if (payload.type == PayloadType.BYTES && payload.bytes != null) {
-          try {
-            final packet = MeshPacket.fromJsonString(
-              utf8.decode(payload.bytes!),
-            );
-            _handleIncoming(packet);
-          } catch (_) {
-            // Malformed packet — drop.
-          }
-        }
-      },
-      onPayloadTransferUpdate: (_, _) {},
-    );
+    // acceptConnection returns Future<bool>. We must not drop the future —
+    // silent failures here mean packets are never received.
+    Nearby()
+        .acceptConnection(
+          endpointId,
+          onPayLoadRecieved: (id, payload) {
+            if (payload.type == PayloadType.BYTES && payload.bytes != null) {
+              try {
+                final packet = MeshPacket.fromJsonString(
+                  utf8.decode(payload.bytes!),
+                );
+                _handleIncoming(packet);
+              } catch (_) {}
+            }
+          },
+          onPayloadTransferUpdate: (_, _) {},
+        )
+        .catchError((_) => false);
   }
 
   void _onConnectionResult(String endpointId, Status status) {
+    _pendingConnections.remove(endpointId);
     if (status == Status.CONNECTED) {
       _connectedEndpoints.add(endpointId);
       _peersController.add(Set.from(_connectedEndpoints));
@@ -181,7 +242,10 @@ class MeshService {
 
   void _onDisconnected(String endpointId) {
     _connectedEndpoints.remove(endpointId);
+    _pendingConnections.remove(endpointId);
     _peersController.add(Set.from(_connectedEndpoints));
+    // Restart discovery so we can find and reconnect to the lost peer (or new ones).
+    _startDiscovery();
   }
 
   // ── Packet handling ──────────────────────────────────────────────────────
@@ -207,7 +271,6 @@ class MeshService {
     }
     _packetController.add(packet);
 
-    // Epidemic forwarding: decrement TTL, rebroadcast after brief delay.
     final forwarded = MeshPacket(
       id: packet.id,
       senderId: packet.senderId,
@@ -226,7 +289,10 @@ class MeshService {
     if (packet.ttl <= 0 || _connectedEndpoints.isEmpty) return;
     final bytes = Uint8List.fromList(utf8.encode(packet.toJsonString()));
     for (final id in List<String>.from(_connectedEndpoints)) {
-      Nearby().sendBytesPayload(id, bytes);
+      Nearby().sendBytesPayload(id, bytes).catchError((_) {
+        _connectedEndpoints.remove(id);
+        _peersController.add(Set.from(_connectedEndpoints));
+      });
     }
   }
 
@@ -240,12 +306,9 @@ class MeshService {
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
     );
-
-    // Mark seen before sending so we never relay our own originations.
     _seenIds.add(packet.id);
     _box.put(packet.id, packet.toJsonString());
     _packetController.add(packet);
-
     _broadcast(packet);
   }
 
@@ -263,7 +326,7 @@ class MeshService {
       type: MeshPacket.typeLocation,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED: Now it saves
+    _box.put(packet.id, packet.toJsonString());
     latestLocations[deviceId] = packet;
     _packetController.add(packet);
     _broadcast(packet);
@@ -279,7 +342,7 @@ class MeshService {
       type: MeshPacket.typeDamage,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED
+    _box.put(packet.id, packet.toJsonString());
     latestDamage[packet.id] = packet;
     _packetController.add(packet);
     _broadcast(packet);
@@ -295,7 +358,7 @@ class MeshService {
       type: MeshPacket.typeSOS,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED
+    _box.put(packet.id, packet.toJsonString());
     latestSOS[packet.id] = packet;
     _packetController.add(packet);
     _broadcast(packet);
@@ -312,7 +375,7 @@ class MeshService {
       type: MeshPacket.typeRoadBlock,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED
+    _box.put(packet.id, packet.toJsonString());
     latestRoadBlocks[packet.id] = packet;
     _packetController.add(packet);
     _broadcast(packet);
@@ -339,7 +402,7 @@ class MeshService {
       type: MeshPacket.typeResource,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED
+    _box.put(packet.id, packet.toJsonString());
     latestResources[packet.id] = packet;
     _packetController.add(packet);
     _broadcast(packet);
@@ -356,7 +419,7 @@ class MeshService {
       type: MeshPacket.typeSafeZone,
     );
     _seenIds.add(packet.id);
-    _box.put(packet.id, packet.toJsonString()); // <--- FIXED
+    _box.put(packet.id, packet.toJsonString());
     latestSafeZones[packet.id] = packet;
     _packetController.add(packet);
     _broadcast(packet);
