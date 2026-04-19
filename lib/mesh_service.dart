@@ -8,6 +8,8 @@ import 'package:nearby_connections/nearby_connections.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import 'user_service.dart';
+
 class MeshPacket {
   static const String typeMessage = 'msg';
   static const String typeLocation = 'loc';
@@ -19,6 +21,7 @@ class MeshPacket {
 
   final String id;
   final String senderId;
+  final String senderName; // display name, travels with packet across hops
   final String payload;
   final int ttl;
   final int timestamp;
@@ -31,6 +34,7 @@ class MeshPacket {
     required this.ttl,
     required this.timestamp,
     this.type = typeMessage,
+    this.senderName = '',
   });
 
   int get hops => 10 - ttl;
@@ -38,6 +42,7 @@ class MeshPacket {
   Map<String, dynamic> toJson() => {
     'id': id,
     'senderId': senderId,
+    if (senderName.isNotEmpty) 'senderName': senderName,
     'payload': payload,
     'ttl': ttl,
     'timestamp': timestamp,
@@ -47,6 +52,7 @@ class MeshPacket {
   factory MeshPacket.fromJson(Map<String, dynamic> j) => MeshPacket(
     id: j['id'] as String,
     senderId: j['senderId'] as String,
+    senderName: (j['senderName'] as String?) ?? '',
     payload: j['payload'] as String,
     ttl: j['ttl'] as int,
     timestamp: j['timestamp'] as int,
@@ -68,24 +74,29 @@ class MeshService {
   static const int _initialTtl = 10;
   static const String _serviceId = 'com.example.meshapp.nearby';
 
-  // Ghost endpoint detection: an endpoint is evicted if no payload has been
-  // received from it within this window. LocationService beacons every 30 s,
-  // so 90 s = 3 missed beacons — a safe threshold before declaring a peer dead.
+  // Ghost endpoint detection: evict if no payload received within this window.
+  // Location beacons every 30s, so 90s = 3 missed beacons before declaring dead.
   static const Duration _staleThreshold = Duration(seconds: 90);
   static const Duration _cleanupInterval = Duration(seconds: 45);
 
   late String deviceId;
+  String _displayName = '';
 
   final Set<String> _connectedEndpoints = {};
   final Set<String> _seenIds = {};
   final Set<String> _pendingConnections = {};
-
-  // Tracks the last time we received ANY payload from each Nearby endpoint.
-  // Used by the cleanup timer to evict ghost peers whose onDisconnected never
-  // fired (common on some custom Android ROMs and older GMS versions).
   final Map<String, int> _endpointLastSeen = {};
 
+  // Maps deviceId → display name, populated from HELLO packets.
+  final Map<String, String> _peerNames = {};
+
   Timer? _cleanupTimer;
+
+  // Stats
+  int messagesReceived = 0;
+  int packetsRelayed = 0;
+  int totalConnections = 0;
+  DateTime? sessionStart;
 
   final Map<String, MeshPacket> latestLocations = {};
   final Map<String, MeshPacket> latestDamage = {};
@@ -102,10 +113,15 @@ class MeshService {
   Stream<MeshPacket> get packetStream => _packetController.stream;
   Stream<Set<String>> get peersStream => _peersController.stream;
   Set<String> get connectedEndpoints => Set.unmodifiable(_connectedEndpoints);
+  Map<String, String> get peerNames => Map.unmodifiable(_peerNames);
+  int get connectedPeerCount => _connectedEndpoints.length;
 
   // ── Initialization ───────────────────────────────────────────────────────
 
   Future<void> init() async {
+    await UserService().load();
+    _displayName = UserService().displayName;
+
     final prefs = await SharedPreferences.getInstance();
     deviceId = prefs.getString('device_id') ?? _newDeviceId();
     await prefs.setString('device_id', deviceId);
@@ -118,32 +134,31 @@ class MeshService {
     return List.generate(8, (_) => chars[rng.nextInt(chars.length)]).join();
   }
 
+  void setDisplayName(String name) => _displayName = name;
+
   // ── Networking ───────────────────────────────────────────────────────────
 
   Future<void> start() async {
     _cleanupTimer?.cancel();
+    sessionStart = DateTime.now();
 
-    // Clear our state FIRST so that the stopAllEndpoints() onDisconnected
-    // callbacks below are no-ops and don't trigger spurious side-effects.
+    // Clear state FIRST so stopAllEndpoints onDisconnected callbacks are no-ops.
     _connectedEndpoints.clear();
     _pendingConnections.clear();
     _endpointLastSeen.clear();
+    _peerNames.clear();
     _peersController.add({});
 
-    // Tear down any stale Nearby Connections session from a previous run or
-    // hot-restart. startAdvertising/startDiscovery throw if already running,
-    // and those errors were previously swallowed silently → nothing connected.
+    // Tear down stale Nearby Connections session from previous run / hot-restart.
     try { await Nearby().stopAllEndpoints(); } catch (_) {}
     try { await Nearby().stopAdvertising(); } catch (_) {}
     try { await Nearby().stopDiscovery(); } catch (_) {}
 
-    // Let the platform layer finish winding down before we restart.
     await Future.delayed(const Duration(milliseconds: 500));
 
     await _startAdvertising();
     await _startDiscovery();
 
-    // Periodically evict ghost endpoints that never fired onDisconnected.
     _cleanupTimer = Timer.periodic(_cleanupInterval, (_) => _evictStaleEndpoints());
   }
 
@@ -164,9 +179,11 @@ class MeshService {
   Future<void> restart() => stop().then((_) => start());
 
   Future<void> _startAdvertising() async {
+    // Advertised name encodes our deviceId so peers can extract it before HELLO.
+    final advertisedName = 'ml2|$deviceId';
     try {
       await Nearby().startAdvertising(
-        deviceId,
+        advertisedName,
         Strategy.P2P_CLUSTER,
         onConnectionInitiated: _onConnectionInitiated,
         onConnectionResult: _onConnectionResult,
@@ -174,11 +191,10 @@ class MeshService {
         serviceId: _serviceId,
       );
     } catch (_) {
-      // Platform may take longer to wind down — retry once after a pause.
       await Future.delayed(const Duration(seconds: 1));
       try {
         await Nearby().startAdvertising(
-          deviceId,
+          advertisedName,
           Strategy.P2P_CLUSTER,
           onConnectionInitiated: _onConnectionInitiated,
           onConnectionResult: _onConnectionResult,
@@ -190,9 +206,10 @@ class MeshService {
   }
 
   Future<void> _startDiscovery() async {
+    final advertisedName = 'ml2|$deviceId';
     try {
       await Nearby().startDiscovery(
-        deviceId,
+        advertisedName,
         Strategy.P2P_CLUSTER,
         onEndpointFound: _onEndpointFound,
         onEndpointLost: (_) {},
@@ -202,7 +219,7 @@ class MeshService {
       await Future.delayed(const Duration(seconds: 1));
       try {
         await Nearby().startDiscovery(
-          deviceId,
+          advertisedName,
           Strategy.P2P_CLUSTER,
           onEndpointFound: _onEndpointFound,
           onEndpointLost: (_) {},
@@ -224,7 +241,7 @@ class MeshService {
     _pendingConnections.add(endpointId);
     try {
       await Nearby().requestConnection(
-        deviceId,
+        'ml2|$deviceId',
         endpointId,
         onConnectionInitiated: _onConnectionInitiated,
         onConnectionResult: _onConnectionResult,
@@ -236,22 +253,31 @@ class MeshService {
   }
 
   void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
-    // acceptConnection registers the payload handler. Not awaiting this
-    // silently drops the future — use .catchError to handle failures.
     Nearby()
         .acceptConnection(
           endpointId,
           onPayLoadRecieved: (senderEndpointId, payload) {
-            // Refresh last-seen timestamp for this Nearby endpoint so the
-            // ghost-cleanup timer knows it's still alive.
             _endpointLastSeen[senderEndpointId] =
                 DateTime.now().millisecondsSinceEpoch;
 
             if (payload.type == PayloadType.BYTES && payload.bytes != null) {
               try {
-                final packet = MeshPacket.fromJsonString(
-                  utf8.decode(payload.bytes!),
-                );
+                final raw = utf8.decode(payload.bytes!);
+                final parsed = jsonDecode(raw) as Map<String, dynamic>;
+
+                // HELLO handshake — not a regular packet, don't relay.
+                if (parsed['kind'] == 'hello') {
+                  final sid = (parsed['sid'] as String?) ?? '';
+                  final name = (parsed['name'] as String?) ?? '';
+                  if (sid.isNotEmpty && name.isNotEmpty) {
+                    _peerNames[sid] = name;
+                    // Trigger UI rebuild with updated peer names.
+                    _peersController.add(Set.from(_connectedEndpoints));
+                  }
+                  return;
+                }
+
+                final packet = MeshPacket.fromJson(parsed);
                 _handleIncoming(packet);
               } catch (_) {}
             }
@@ -265,10 +291,11 @@ class MeshService {
     _pendingConnections.remove(endpointId);
     if (status == Status.CONNECTED) {
       _connectedEndpoints.add(endpointId);
-      // Seed last-seen so the new peer has the full stale window before the
-      // cleanup timer could evict it (in case it doesn't send immediately).
       _endpointLastSeen[endpointId] = DateTime.now().millisecondsSinceEpoch;
+      totalConnections++;
       _peersController.add(Set.from(_connectedEndpoints));
+      // Send HELLO so peer learns our display name.
+      _sendHello(endpointId);
     }
   }
 
@@ -277,8 +304,7 @@ class MeshService {
     _pendingConnections.remove(endpointId);
     _endpointLastSeen.remove(endpointId);
     _peersController.add(Set.from(_connectedEndpoints));
-    // Do NOT restart discovery here — it's already running continuously and
-    // calling startDiscovery() while it's active just throws and creates races.
+    // Do NOT restart discovery here — already running continuously.
   }
 
   // Evicts peers whose onDisconnected never fired (GMS bug on some devices).
@@ -287,9 +313,7 @@ class MeshService {
         DateTime.now().millisecondsSinceEpoch - _staleThreshold.inMilliseconds;
     bool changed = false;
     for (final id in List<String>.from(_connectedEndpoints)) {
-      final lastSeen = _endpointLastSeen[id] ?? 0;
-      if (lastSeen < cutoff) {
-        // Best-effort disconnect — may be a no-op if the endpoint is already gone.
+      if ((_endpointLastSeen[id] ?? 0) < cutoff) {
         Nearby().disconnectFromEndpoint(id);
         _connectedEndpoints.remove(id);
         _endpointLastSeen.remove(id);
@@ -297,6 +321,12 @@ class MeshService {
       }
     }
     if (changed) _peersController.add(Set.from(_connectedEndpoints));
+  }
+
+  void _sendHello(String endpointId) {
+    final hello = jsonEncode({'kind': 'hello', 'sid': deviceId, 'name': _displayName});
+    final bytes = Uint8List.fromList(utf8.encode(hello));
+    Nearby().sendBytesPayload(endpointId, bytes);
   }
 
   // ── Packet handling ──────────────────────────────────────────────────────
@@ -307,6 +337,8 @@ class MeshService {
 
     _seenIds.add(packet.id);
     _box.put(packet.id, packet.toJsonString());
+    messagesReceived++;
+
     if (packet.type == MeshPacket.typeLocation) {
       latestLocations[packet.senderId] = packet;
     } else if (packet.type == MeshPacket.typeDamage) {
@@ -325,6 +357,7 @@ class MeshService {
     final forwarded = MeshPacket(
       id: packet.id,
       senderId: packet.senderId,
+      senderName: packet.senderName,
       payload: packet.payload,
       ttl: packet.ttl - 1,
       timestamp: packet.timestamp,
@@ -340,22 +373,24 @@ class MeshService {
     if (packet.ttl <= 0 || _connectedEndpoints.isEmpty) return;
     final bytes = Uint8List.fromList(utf8.encode(packet.toJsonString()));
     for (final id in List<String>.from(_connectedEndpoints)) {
-      // sendBytesPayload in the native plugin always returns success even for
-      // dead endpoints — we cannot rely on catchError for ghost detection.
-      // Ghost cleanup is handled by _evictStaleEndpoints() instead.
+      // sendBytesPayload always returns success even for dead endpoints —
+      // ghost cleanup is handled by _evictStaleEndpoints() instead.
       Nearby().sendBytesPayload(id, bytes);
+      packetsRelayed++;
     }
   }
 
   // ── Public API ───────────────────────────────────────────────────────────
 
-  Future<void> sendPacket(String payload) async {
+  Future<void> sendPacket(String payload, {String type = MeshPacket.typeMessage}) async {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: payload,
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
+      type: type,
     );
     _seenIds.add(packet.id);
     _box.put(packet.id, packet.toJsonString());
@@ -371,6 +406,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({'lat': lat, 'lng': lng, 'status': status}),
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
@@ -387,6 +423,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({'lat': lat, 'lng': lng, 'note': note}),
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
@@ -403,6 +440,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({'lat': lat, 'lng': lng, 'note': note}),
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
@@ -420,6 +458,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({'lat': lat, 'lng': lng, 'note': note}),
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,
@@ -442,6 +481,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({
         'lat': lat,
         'lng': lng,
@@ -464,6 +504,7 @@ class MeshService {
     final packet = MeshPacket(
       id: const Uuid().v4(),
       senderId: deviceId,
+      senderName: _displayName,
       payload: jsonEncode({'lat': lat, 'lng': lng, 'note': note}),
       ttl: _initialTtl,
       timestamp: DateTime.now().millisecondsSinceEpoch,

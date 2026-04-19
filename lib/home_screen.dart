@@ -3,12 +3,13 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'map_screen.dart';
 import 'mesh_service.dart';
+import 'user_service.dart';
 
 // ── Palette ──────────────────────────────────────────────────────────────────
 
 const _bg = Color(0xFFF0F4FF);
 const _surface = Colors.white;
-const _primary = Color(0xFF4F46E5);   // indigo
+const _primary = Color(0xFF4F46E5); // indigo
 const _onPrimary = Colors.white;
 const _textDark = Color(0xFF1E1B4B);
 const _textMid = Color(0xFF6B7280);
@@ -20,6 +21,17 @@ const _colorBlock = Color(0xFFC2410C);
 const _colorResource = Color(0xFF0284C7);
 const _colorSafeZone = Color(0xFF059669);
 const _colorMessage = Color(0xFF7C3AED);
+
+// Quick emergency preset messages
+const _presets = [
+  ('🆘', 'Yardıma ihtiyacım var, acil yardım gönderin!'),
+  ('✅', 'Güvendeyim, hareket etmiyorum.'),
+  ('💧', 'Su ve yiyeceğe ihtiyacımız var.'),
+  ('🏥', 'Tıbbi yardım gerekli, acil!'),
+  ('🪨', 'Enkaz altındayım, ses duyabiliyorum.'),
+  ('🚩', 'Tahliye noktasına ulaştım.'),
+  ('⚠️', 'Bölge güvenli değil, dikkat edin!'),
+];
 
 // ── Screen ───────────────────────────────────────────────────────────────────
 
@@ -44,12 +56,11 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
 
-    // Load history — include messages this time.
     _packets.addAll(
       _mesh.storedPackets
           .where((p) => p.type != MeshPacket.typeLocation)
           .toList()
-          .reversed, // stored packets come newest-first; we display oldest-first
+          .reversed,
     );
 
     _packetSub = _mesh.packetStream.listen((packet) {
@@ -59,7 +70,7 @@ class _HomeScreenState extends State<HomeScreen> {
         if (idx != -1) {
           _packets[idx] = packet;
         } else {
-          _packets.add(packet); // append so newest is at bottom
+          _packets.add(packet);
         }
       });
       _scrollToBottom();
@@ -68,6 +79,13 @@ class _HomeScreenState extends State<HomeScreen> {
     _peersSub = _mesh.peersStream.listen((peers) {
       if (!mounted) return;
       setState(() => _peers = peers);
+    });
+
+    // Prompt for display name on first launch.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !UserService().hasName) {
+        _editDisplayName();
+      }
     });
   }
 
@@ -99,6 +117,151 @@ class _HomeScreenState extends State<HomeScreen> {
     _mesh.sendPacket(jsonEncode({'text': text}));
   }
 
+  Future<void> _editDisplayName() async {
+    final ctrl = TextEditingController(text: UserService().displayName);
+    final name = await showDialog<String>(
+      context: context,
+      barrierDismissible: UserService().hasName,
+      builder: (ctx) {
+        String? errorText;
+        return PopScope(
+          canPop: UserService().hasName,
+          child: StatefulBuilder(
+            builder: (context, setS) {
+              void submit() {
+                final v = ctrl.text.trim();
+                if (v.isEmpty) {
+                  setS(() => errorText = 'İsim boş olamaz');
+                  return;
+                }
+                Navigator.pop(ctx, v);
+              }
+
+              return AlertDialog(
+                title: const Text('Görünen Adınız'),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('Bu isim yakındaki cihazlara gösterilir.'),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: ctrl,
+                      autofocus: true,
+                      textInputAction: TextInputAction.done,
+                      decoration: InputDecoration(
+                        labelText: 'İsim',
+                        hintText: 'Adınızı girin',
+                        errorText: errorText,
+                      ),
+                      onSubmitted: (_) => submit(),
+                    ),
+                  ],
+                ),
+                actions: [
+                  if (UserService().hasName)
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('İptal'),
+                    ),
+                  FilledButton(onPressed: submit, child: const Text('Kaydet')),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+    ctrl.dispose();
+    if (!mounted || name == null || name.isEmpty) return;
+    await UserService().saveName(name);
+    _mesh.setDisplayName(name);
+    setState(() {});
+  }
+
+  void _showQuickPresets() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => Container(
+        decoration: const BoxDecoration(
+          color: _surface,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        padding: EdgeInsets.fromLTRB(
+          16,
+          12,
+          16,
+          MediaQuery.of(context).viewInsets.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            const Text(
+              'Hızlı Mesajlar',
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                fontSize: 16,
+                color: _textDark,
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Hazır acil durum mesajları',
+              style: TextStyle(fontSize: 12, color: _textMid),
+            ),
+            const SizedBox(height: 10),
+            ...List.generate(_presets.length, (i) {
+              final (emoji, text) = _presets[i];
+              return InkWell(
+                onTap: () {
+                  Navigator.pop(context);
+                  _mesh.sendPacket(jsonEncode({'text': text}));
+                },
+                borderRadius: BorderRadius.circular(10),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+                  child: Row(
+                    children: [
+                      Text(emoji,
+                          style: const TextStyle(fontSize: 22)),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          text,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            color: _textDark,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                      const Icon(Icons.send_rounded,
+                          size: 15, color: _textLight),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -107,58 +270,66 @@ class _HomeScreenState extends State<HomeScreen> {
       body: Column(
         children: [
           _StatusBanner(
+            displayName: UserService().displayName,
             deviceId: _mesh.deviceId,
             peers: _peers,
+            peerNames: _mesh.peerNames,
             onReconnect: _mesh.restart,
+            onEditName: _editDisplayName,
           ),
           Expanded(child: _buildFeed()),
-          _ChatInput(controller: _msgCtrl, onSend: _sendMessage),
+          _ChatInput(
+            controller: _msgCtrl,
+            onSend: _sendMessage,
+            onQuickPresets: _showQuickPresets,
+          ),
+          _DevStatsBox(mesh: _mesh),
         ],
       ),
     );
   }
 
   AppBar _buildAppBar() => AppBar(
-    backgroundColor: _surface,
-    surfaceTintColor: Colors.transparent,
-    elevation: 0,
-    shadowColor: Colors.black12,
-    scrolledUnderElevation: 2,
-    title: Row(
-      children: [
-        Container(
-          width: 32,
-          height: 32,
-          decoration: BoxDecoration(
-            color: _primary,
-            borderRadius: BorderRadius.circular(8),
+        backgroundColor: _surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        shadowColor: Colors.black12,
+        scrolledUnderElevation: 2,
+        title: Row(
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: _primary,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.hub_rounded, color: _onPrimary, size: 18),
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'MeshNet',
+              style: TextStyle(
+                color: _textDark,
+                fontWeight: FontWeight.w700,
+                fontSize: 19,
+                letterSpacing: -0.3,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.map_rounded, color: _primary),
+            tooltip: 'Harita',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const MapScreen()),
+            ),
           ),
-          child: const Icon(Icons.hub_rounded, color: _onPrimary, size: 18),
-        ),
-        const SizedBox(width: 10),
-        const Text(
-          'MeshNet',
-          style: TextStyle(
-            color: _textDark,
-            fontWeight: FontWeight.w700,
-            fontSize: 19,
-            letterSpacing: -0.3,
-          ),
-        ),
-      ],
-    ),
-    actions: [
-      IconButton(
-        icon: const Icon(Icons.map_rounded, color: _primary),
-        tooltip: 'Harita',
-        onPressed: () => Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const MapScreen()),
-        ),
-      ),
-      const SizedBox(width: 4),
-    ],
-  );
+          const SizedBox(width: 4),
+        ],
+      );
 
   Widget _buildFeed() {
     if (_packets.isEmpty) {
@@ -202,12 +373,21 @@ class _HomeScreenState extends State<HomeScreen> {
       itemBuilder: (ctx, i) {
         final p = _packets[i];
         if (p.type == MeshPacket.typeMessage) {
+          final isOwn = p.senderId == _mesh.deviceId;
+          final label = isOwn
+              ? (UserService().displayName.isEmpty
+                  ? _mesh.deviceId
+                  : UserService().displayName)
+              : (p.senderName.isNotEmpty
+                  ? p.senderName
+                  : (_mesh.peerNames[p.senderId] ?? p.senderId));
           return _MessageBubble(
             packet: p,
-            isOwn: p.senderId == _mesh.deviceId,
+            isOwn: isOwn,
+            senderLabel: label,
           );
         }
-        return _IncidentCard(packet: p);
+        return _IncidentCard(packet: p, peerNames: _mesh.peerNames);
       },
     );
   }
@@ -217,18 +397,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
 class _StatusBanner extends StatelessWidget {
   const _StatusBanner({
+    required this.displayName,
     required this.deviceId,
     required this.peers,
+    required this.peerNames,
     required this.onReconnect,
+    required this.onEditName,
   });
 
+  final String displayName;
   final String deviceId;
   final Set<String> peers;
+  final Map<String, String> peerNames;
   final VoidCallback onReconnect;
+  final VoidCallback onEditName;
 
   @override
   Widget build(BuildContext context) {
     final connected = peers.isNotEmpty;
+    final nameLabel = displayName.isNotEmpty ? displayName : deviceId;
+
     return Container(
       decoration: BoxDecoration(
         color: _surface,
@@ -237,37 +425,41 @@ class _StatusBanner extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       child: Row(
         children: [
-          // Device chip
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: _primary.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.smartphone_rounded,
-                    size: 13, color: _primary),
-                const SizedBox(width: 5),
-                Text(
-                  deviceId,
-                  style: const TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                    color: _primary,
-                    letterSpacing: 0.5,
+          // Own name chip — tappable to edit
+          GestureDetector(
+            onTap: onEditName,
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: _primary.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.person_rounded, size: 13, color: _primary),
+                  const SizedBox(width: 5),
+                  Text(
+                    nameLabel,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: _primary,
+                    ),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 4),
+                  const Icon(Icons.edit_rounded, size: 10, color: _primary),
+                ],
+              ),
             ),
           ),
           const SizedBox(width: 8),
           // Peer status chip
           Expanded(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
                 color: connected
                     ? const Color(0xFFECFDF5)
@@ -277,7 +469,6 @@ class _StatusBanner extends StatelessWidget {
                   color: connected
                       ? const Color(0xFF6EE7B7)
                       : Colors.grey.shade300,
-                  width: 1,
                 ),
               ),
               child: Row(
@@ -296,9 +487,7 @@ class _StatusBanner extends StatelessWidget {
                   const SizedBox(width: 6),
                   Flexible(
                     child: Text(
-                      connected
-                          ? '${peers.length} cihaz bağlı'
-                          : 'Taranıyor…',
+                      _peerChipLabel(connected, peers, peerNames),
                       style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
@@ -314,7 +503,6 @@ class _StatusBanner extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 4),
-          // Reconnect button
           GestureDetector(
             onTap: onReconnect,
             child: Container(
@@ -332,23 +520,49 @@ class _StatusBanner extends StatelessWidget {
       ),
     );
   }
+
+  String _peerChipLabel(
+    bool connected,
+    Set<String> peers,
+    Map<String, String> peerNames,
+  ) {
+    if (!connected) return 'Taranıyor…';
+    // Show names if we have them and count is small enough to fit.
+    if (peers.length <= 3) {
+      final names = peers
+          .map((id) => peerNames.values.isNotEmpty
+              ? (peerNames.entries
+                      .where((e) => e.key == id)
+                      .map((e) => e.value)
+                      .firstOrNull ??
+                  id.substring(0, 4))
+              : id.substring(0, 4))
+          .join(', ');
+      return names;
+    }
+    return '${peers.length} cihaz bağlı';
+  }
 }
 
 // ── Message bubble ────────────────────────────────────────────────────────────
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.packet, required this.isOwn});
+  const _MessageBubble({
+    required this.packet,
+    required this.isOwn,
+    required this.senderLabel,
+  });
 
   final MeshPacket packet;
   final bool isOwn;
+  final String senderLabel;
 
   @override
   Widget build(BuildContext context) {
     final data = jsonDecode(packet.payload) as Map<String, dynamic>;
     final text = (data['text'] as String?) ?? packet.payload;
     final time = DateTime.fromMillisecondsSinceEpoch(packet.timestamp);
-    final timeStr =
-        '${time.hour}:${time.minute.toString().padLeft(2, '0')}';
+    final timeStr = '${time.hour}:${time.minute.toString().padLeft(2, '0')}';
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
@@ -362,7 +576,9 @@ class _MessageBubble extends StatelessWidget {
               radius: 14,
               backgroundColor: _colorMessage.withValues(alpha: 0.15),
               child: Text(
-                packet.senderId.substring(0, 1),
+                senderLabel.isNotEmpty
+                    ? senderLabel.substring(0, 1).toUpperCase()
+                    : '?',
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
@@ -377,7 +593,8 @@ class _MessageBubble extends StatelessWidget {
               constraints: BoxConstraints(
                 maxWidth: MediaQuery.of(context).size.width * 0.70,
               ),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
                 color: isOwn ? _primary : _surface,
                 borderRadius: BorderRadius.only(
@@ -393,9 +610,8 @@ class _MessageBubble extends StatelessWidget {
                     offset: const Offset(0, 2),
                   ),
                 ],
-                border: isOwn
-                    ? null
-                    : Border.all(color: Colors.grey.shade200),
+                border:
+                    isOwn ? null : Border.all(color: Colors.grey.shade200),
               ),
               child: Column(
                 crossAxisAlignment: isOwn
@@ -404,8 +620,8 @@ class _MessageBubble extends StatelessWidget {
                 children: [
                   if (!isOwn) ...[
                     Text(
-                      packet.senderId,
-                      style: TextStyle(
+                      senderLabel,
+                      style: const TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.w700,
                         color: _colorMessage,
@@ -423,14 +639,39 @@ class _MessageBubble extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  Text(
-                    timeStr,
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: isOwn
-                          ? _onPrimary.withValues(alpha: 0.6)
-                          : _textLight,
-                    ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (packet.hops > 0) ...[
+                        Icon(
+                          Icons.compare_arrows_rounded,
+                          size: 9,
+                          color: isOwn
+                              ? _onPrimary.withValues(alpha: 0.5)
+                              : _textLight,
+                        ),
+                        const SizedBox(width: 2),
+                        Text(
+                          '${packet.hops}',
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: isOwn
+                                ? _onPrimary.withValues(alpha: 0.5)
+                                : _textLight,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                      ],
+                      Text(
+                        timeStr,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: isOwn
+                              ? _onPrimary.withValues(alpha: 0.6)
+                              : _textLight,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -446,23 +687,19 @@ class _MessageBubble extends StatelessWidget {
 // ── Incident card ─────────────────────────────────────────────────────────────
 
 class _IncidentCard extends StatelessWidget {
-  const _IncidentCard({required this.packet});
+  const _IncidentCard({required this.packet, required this.peerNames});
   final MeshPacket packet;
+  final Map<String, String> peerNames;
 
   @override
   Widget build(BuildContext context) {
     final data = jsonDecode(packet.payload) as Map<String, dynamic>;
     final note = (data['note'] as String?) ?? '';
     final time = DateTime.fromMillisecondsSinceEpoch(packet.timestamp);
-    final timeStr =
-        '${time.hour}:${time.minute.toString().padLeft(2, '0')}';
+    final timeStr = '${time.hour}:${time.minute.toString().padLeft(2, '0')}';
 
     final (label, icon, accent) = switch (packet.type) {
-      MeshPacket.typeSOS => (
-        'YARDIM ÇAĞRISI',
-        Icons.sos_rounded,
-        _colorSOS,
-      ),
+      MeshPacket.typeSOS => ('YARDIM ÇAĞRISI', Icons.sos_rounded, _colorSOS),
       MeshPacket.typeDamage => (
         'HASAR BİLDİRİMİ',
         Icons.warning_rounded,
@@ -486,6 +723,10 @@ class _IncidentCard extends StatelessWidget {
       _ => ('BİLGİ', Icons.info_rounded, _textMid),
     };
 
+    final senderLabel = packet.senderName.isNotEmpty
+        ? packet.senderName
+        : (peerNames[packet.senderId] ?? packet.senderId);
+
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
@@ -506,7 +747,6 @@ class _IncidentCard extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Colored left accent bar
               Container(width: 4, color: accent),
               Expanded(
                 child: Padding(
@@ -514,7 +754,6 @@ class _IncidentCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Header row
                       Row(
                         children: [
                           Container(
@@ -540,9 +779,7 @@ class _IncidentCard extends StatelessWidget {
                           Text(
                             timeStr,
                             style: const TextStyle(
-                              color: _textLight,
-                              fontSize: 11,
-                            ),
+                                color: _textLight, fontSize: 11),
                           ),
                         ],
                       ),
@@ -551,26 +788,21 @@ class _IncidentCard extends StatelessWidget {
                         Text(
                           note,
                           style: const TextStyle(
-                            color: _textDark,
-                            fontSize: 14,
-                            height: 1.4,
-                          ),
+                              color: _textDark, fontSize: 14, height: 1.4),
                         ),
                       ],
                       const SizedBox(height: 8),
-                      // Footer
                       Row(
                         children: [
                           Icon(Icons.person_outline_rounded,
                               size: 12, color: _textLight),
                           const SizedBox(width: 3),
                           Text(
-                            packet.senderId,
+                            senderLabel,
                             style: const TextStyle(
-                              color: _textLight,
-                              fontSize: 10,
-                              fontFamily: 'monospace',
-                            ),
+                                color: _textLight,
+                                fontSize: 10,
+                                fontFamily: 'monospace'),
                           ),
                           const SizedBox(width: 8),
                           Container(
@@ -626,10 +858,15 @@ class _IncidentCard extends StatelessWidget {
 // ── Chat input ────────────────────────────────────────────────────────────────
 
 class _ChatInput extends StatelessWidget {
-  const _ChatInput({required this.controller, required this.onSend});
+  const _ChatInput({
+    required this.controller,
+    required this.onSend,
+    this.onQuickPresets,
+  });
 
   final TextEditingController controller;
   final VoidCallback onSend;
+  final VoidCallback? onQuickPresets;
 
   @override
   Widget build(BuildContext context) {
@@ -645,14 +882,26 @@ class _ChatInput extends StatelessWidget {
           ),
         ],
       ),
-      padding: EdgeInsets.only(
-        left: 12,
-        right: 12,
-        top: 10,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 10,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       child: Row(
         children: [
+          // Quick presets button
+          if (onQuickPresets != null)
+            GestureDetector(
+              onTap: onQuickPresets,
+              child: Container(
+                width: 40,
+                height: 40,
+                margin: const EdgeInsets.only(right: 8),
+                decoration: BoxDecoration(
+                  color: _bg,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: Colors.grey.shade200),
+                ),
+                child: const Icon(Icons.bolt_rounded,
+                    color: _primary, size: 20),
+              ),
+            ),
           Expanded(
             child: TextField(
               controller: controller,
@@ -661,7 +910,8 @@ class _ChatInput extends StatelessWidget {
               style: const TextStyle(color: _textDark, fontSize: 15),
               decoration: InputDecoration(
                 hintText: 'Ağa mesaj gönder…',
-                hintStyle: const TextStyle(color: _textLight, fontSize: 14),
+                hintStyle:
+                    const TextStyle(color: _textLight, fontSize: 14),
                 filled: true,
                 fillColor: _bg,
                 contentPadding: const EdgeInsets.symmetric(
@@ -676,7 +926,8 @@ class _ChatInput extends StatelessWidget {
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(24),
-                  borderSide: const BorderSide(color: _primary, width: 1.5),
+                  borderSide:
+                      const BorderSide(color: _primary, width: 1.5),
                 ),
               ),
             ),
@@ -698,8 +949,74 @@ class _ChatInput extends StatelessWidget {
                   ),
                 ],
               ),
-              child: const Icon(Icons.send_rounded,
-                  color: _onPrimary, size: 20),
+              child:
+                  const Icon(Icons.send_rounded, color: _onPrimary, size: 20),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Dev stats box ─────────────────────────────────────────────────────────────
+
+class _DevStatsBox extends StatefulWidget {
+  const _DevStatsBox({required this.mesh});
+  final MeshService mesh;
+
+  @override
+  State<_DevStatsBox> createState() => _DevStatsBoxState();
+}
+
+class _DevStatsBoxState extends State<_DevStatsBox> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  String _uptime() {
+    final start = widget.mesh.sessionStart;
+    if (start == null) return '—';
+    final d = DateTime.now().difference(start);
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '${h}h ${m}m ${s}s' : '${m}m ${s}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final m = widget.mesh;
+    return Container(
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.developer_mode_rounded,
+              size: 11, color: Color(0xFF475569)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              '${m.connectedPeerCount} peer  ·  ${m.messagesReceived} rx  ·  ${m.packetsRelayed} relayed  ·  ${m.totalConnections} conn  ·  ${_uptime()}',
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 10,
+                color: Color(0xFF64748B),
+                letterSpacing: 0.2,
+              ),
+              overflow: TextOverflow.ellipsis,
             ),
           ),
         ],
